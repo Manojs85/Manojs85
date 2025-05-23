@@ -141,3 +141,97 @@ def analyze_file_modification(filepath, original_checksum=None, current_checksum
     message = f"Info: No suspicious modification detected for '{filepath}' based on provided checksums."
     logger.info(message)
     return message
+
+# --- Threat Scoring Logic ---
+
+# Assuming logger is already configured at the module level or obtained
+# logger = logging.getLogger("RansomwareAnalyzer.Scoring")
+# Re-using the existing module logger, or you can define a new one.
+# For consistency with the existing pattern in this file:
+logger_scoring = logging.getLogger("RansomwareAnalyzer.Scoring")
+
+
+# Define score constants (can be tuned)
+SCORE_KNOWN_HASH = 95
+SCORE_ML_SUSPICIOUS_HIGH_CONF = 90 # For ML results with high confidence
+SCORE_ML_SUSPICIOUS_MED_CONF = 75  # For ML results with medium confidence
+SCORE_BEHAVIORAL_MODIFICATION_UNCOMMON = 70 # From analyze_file_modification
+SCORE_CONTENT_PATTERN = 65
+SCORE_BEHAVIORAL_MODIFICATION_COMMON = 50
+SCORE_SUSPICIOUS_EXTENSION = 45
+SCORE_ML_SUSPICIOUS_LOW_CONF = 40 # For ML results with low confidence
+SCORE_DEFAULT_CLEAN = 5
+
+def calculate_threat_score(analysis_result_str=None, ml_result_dict=None, behavioral_result_str=None):
+    """
+    Calculates a threat score based on various analysis inputs.
+    Inputs are expected to be the string outputs from analyze_file, 
+    the dictionary from predict_ransomware_behavior, and string from analyze_file_modification.
+    """
+    final_score = 0
+    reasons = []
+
+    # 1. Score from analyze_file output string
+    if analysis_result_str:
+        if "Known ransomware hash match" in analysis_result_str:
+            final_score = max(final_score, SCORE_KNOWN_HASH)
+            reasons.append(f"Known Hash (Score: {SCORE_KNOWN_HASH})")
+        elif "Suspicious: Known ransomware signature pattern found" in analysis_result_str:
+            final_score = max(final_score, SCORE_CONTENT_PATTERN)
+            reasons.append(f"Content Pattern (Score: {SCORE_CONTENT_PATTERN})")
+        elif "Suspicious: Known ransomware extension" in analysis_result_str:
+            final_score = max(final_score, SCORE_SUSPICIOUS_EXTENSION)
+            reasons.append(f"Suspicious Extension (Score: {SCORE_SUSPICIOUS_EXTENSION})")
+        elif "File seems clean" in analysis_result_str:
+            # Only apply if no other suspicious indicators push score higher
+            if final_score < SCORE_DEFAULT_CLEAN: # Check if it's still at initial 0 or a very low score
+                 final_score = SCORE_DEFAULT_CLEAN
+            reasons.append(f"Clean by basic scan (Score: {SCORE_DEFAULT_CLEAN})")
+
+
+    # 2. Score from ML model result dictionary
+    if ml_result_dict and isinstance(ml_result_dict, dict) and ml_result_dict.get('is_suspicious'):
+        confidence = ml_result_dict.get('confidence', 0.0)
+        if confidence >= 0.8: # High confidence
+            final_score = max(final_score, SCORE_ML_SUSPICIOUS_HIGH_CONF)
+            reasons.append(f"ML High Confidence (Score: {SCORE_ML_SUSPICIOUS_HIGH_CONF}, Conf: {confidence:.2f})")
+        elif confidence >= 0.5: # Medium confidence
+            final_score = max(final_score, SCORE_ML_SUSPICIOUS_MED_CONF)
+            reasons.append(f"ML Medium Confidence (Score: {SCORE_ML_SUSPICIOUS_MED_CONF}, Conf: {confidence:.2f})")
+        else: # Low confidence
+            final_score = max(final_score, SCORE_ML_SUSPICIOUS_LOW_CONF)
+            reasons.append(f"ML Low Confidence (Score: {SCORE_ML_SUSPICIOUS_LOW_CONF}, Conf: {confidence:.2f})")
+    
+    # 3. Score from behavioral analysis (analyze_file_modification output string)
+    if behavioral_result_str:
+        if "Potential unauthorized encryption activity detected on" in behavioral_result_str and "uncommon file type" in behavioral_result_str :
+            final_score = max(final_score, SCORE_BEHAVIORAL_MODIFICATION_UNCOMMON)
+            reasons.append(f"Behavioral - Uncommon Mod (Score: {SCORE_BEHAVIORAL_MODIFICATION_UNCOMMON})")
+        elif "File" in behavioral_result_str and "has been modified (checksum changed)" in behavioral_result_str:
+            final_score = max(final_score, SCORE_BEHAVIORAL_MODIFICATION_COMMON)
+            reasons.append(f"Behavioral - Common Mod (Score: {SCORE_BEHAVIORAL_MODIFICATION_COMMON})")
+
+
+    if not reasons and final_score == 0: # Default for no information or truly clean and no explicit clean flags hit
+        reasons.append("No specific threat indicators found.")
+        # Ensure final_score reflects the default clean score if it's still 0
+        final_score = SCORE_DEFAULT_CLEAN 
+
+    # Ensure the lowest score is SCORE_DEFAULT_CLEAN if no threat indicators found
+    # and it wasn't already set by "File seems clean" logic
+    if not reasons or (len(reasons) == 1 and "Clean by basic scan" in reasons[0] and final_score < SCORE_DEFAULT_CLEAN):
+         if final_score < SCORE_DEFAULT_CLEAN: # Handles case where final_score might be 0
+            final_score = SCORE_DEFAULT_CLEAN
+    
+    # Correct the case where "Clean by basic scan" might be the only reason but final_score is 0
+    if final_score == 0 and any("Clean by basic scan" in r for r in reasons):
+        final_score = SCORE_DEFAULT_CLEAN
+    
+    # If truly no reasons and score is 0, it means no analysis yielded anything, default to clean.
+    if not reasons and final_score == 0:
+        reasons.append(f"No specific threat indicators found (Score: {SCORE_DEFAULT_CLEAN})")
+        final_score = SCORE_DEFAULT_CLEAN
+
+
+    logger_scoring.info(f"Threat score calculated: {final_score}. Reasons: {'; '.join(reasons) or 'N/A'}")
+    return final_score, reasons

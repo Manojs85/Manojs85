@@ -188,5 +188,41 @@ class TestAnalyzer(unittest.TestCase):
         self.assertIn(f"Suspicious: Known ransomware extension for file: {filepath_ext}", log_content)
         self.assertIn("DEBUG", log_content) # Check if DEBUG level logs are present
 
+    # Tests for calculate_threat_score
+    def test_calculate_threat_score_hash_match(self):
+        score, reasons = calculate_threat_score(analysis_result_str="Suspicious: Known ransomware hash match (Threat: TestWare)")
+        self.assertEqual(score, 95) # SCORE_KNOWN_HASH
+        self.assertIn("Known Hash", reasons[0])
+
+    def test_calculate_threat_score_ml_high_confidence(self):
+        score, reasons = calculate_threat_score(ml_result_dict={'is_suspicious': True, 'confidence': 0.9})
+        self.assertEqual(score, 90) # SCORE_ML_SUSPICIOUS_HIGH_CONF
+        self.assertIn("ML High Confidence", reasons[0])
+
+    def test_calculate_threat_score_behavioral_uncommon(self):
+        score, reasons = calculate_threat_score(behavioral_result_str="Suspicious: Potential unauthorized encryption activity detected on 'test.dat' (uncommon file type)")
+        self.assertEqual(score, 70) # SCORE_BEHAVIORAL_MODIFICATION_UNCOMMON
+        self.assertIn("Behavioral - Uncommon Mod", reasons[0])
+
+    def test_calculate_threat_score_multiple_inputs(self):
+        # Extension + ML Medium
+        score, reasons = calculate_threat_score(
+            analysis_result_str="Suspicious: Known ransomware extension",
+            ml_result_dict={'is_suspicious': True, 'confidence': 0.6}
+        )
+        self.assertEqual(score, 75) # SCORE_ML_SUSPICIOUS_MED_CONF (higher than extension)
+        self.assertTrue(any("ML Medium Confidence" in r for r in reasons))
+        self.assertTrue(any("Suspicious Extension" in r for r in reasons))
+        
+    def test_calculate_threat_score_clean(self):
+        score, reasons = calculate_threat_score(analysis_result_str="File seems clean")
+        self.assertEqual(score, 5) # SCORE_DEFAULT_CLEAN
+        self.assertIn("Clean by basic scan", reasons[0])
+
+    def test_calculate_threat_score_no_input(self):
+        score, reasons = calculate_threat_score()
+        self.assertEqual(score, 5) # SCORE_DEFAULT_CLEAN
+        self.assertIn("No specific threat indicators found", reasons[0])
+
 if __name__ == '__main__':
     unittest.main()
