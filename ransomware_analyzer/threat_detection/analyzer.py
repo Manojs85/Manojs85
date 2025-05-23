@@ -16,19 +16,25 @@ KNOWN_RANSOMWARE_HASHES = {
 def get_file_hash(filepath):
     """
     Calculates the SHA256 hash of a file's content.
+    Reads file in chunks to efficiently hash large files without loading entirely into memory.
     """
+    sha256_hasher = hashlib.sha256()
     try:
-        sha256_hash = hashlib.sha256()
-        with open(filepath, "rb") as f:
-            # Read and update hash string value in blocks of 4K
-            for byte_block in iter(lambda: f.read(4096), b""):
-                sha256_hash.update(byte_block)
-        return sha256_hash.hexdigest()
+        with open(filepath, 'rb') as f:
+            while True:
+                chunk = f.read(4096) # Read in 4KB chunks
+                if not chunk:
+                    break
+                sha256_hasher.update(chunk)
+        return sha256_hasher.hexdigest()
     except FileNotFoundError:
-        logger.error(f"File not found at {filepath}")
+        logger.error(f"File not found during hashing: {filepath}", extra={'filepath': filepath})
         return None
-    except Exception as e:
-        logger.error(f"Error hashing file {filepath}: {e}")
+    except OSError as e: # Catch other potential I/O errors
+        logger.error(f"OS error during hashing of file {filepath}: {e}", extra={'filepath': filepath, 'error': str(e)})
+        return None
+    except Exception as e: # Catch any other unexpected errors
+        logger.error(f"Unexpected error hashing file {filepath}: {e}", extra={'filepath': filepath, 'error': str(e)})
         return None
 
 def analyze_file(filepath):
@@ -81,6 +87,9 @@ def analyze_file(filepath):
 
     try:
         # Uses 'with open', ensuring file handle closure.
+        # Content check is limited to the first 100 bytes for performance and to quickly find known markers
+        # if present at the beginning of the file.
+        # TODO: Consider more extensive content scanning for future versions, though this has performance implications.
         with open(filepath, 'rb') as f:
             file_content = f.read(100) # Read first 100 bytes for signature pattern
             if b"RANSOMWARE_SIGNATURE_TEST" in file_content:

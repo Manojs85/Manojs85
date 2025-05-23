@@ -224,5 +224,24 @@ class TestAnalyzer(unittest.TestCase):
         self.assertEqual(score, 5) # SCORE_DEFAULT_CLEAN
         self.assertIn("No specific threat indicators found", reasons[0])
 
+    def test_get_file_hash_correctness_with_chunking(self):
+        # Create a dummy file with some content
+        dummy_filepath = os.path.join(self.dummy_dir_path, "chunk_test_file.dat")
+        # Make it a bit larger than one chunk (e.g. > 4KB if chunk size is 4KB, let's use 8KB)
+        test_content = b"This is some test content for hashing, " * (256 * 2) # Approx 8KB
+        with open(dummy_filepath, "wb") as f:
+            f.write(test_content)
+
+        # Calculate hash using the chunked method from analyzer.py
+        chunked_hash = get_file_hash(dummy_filepath)
+
+        # Calculate hash using a simple full-read method for verification
+        import hashlib
+        expected_hash = hashlib.sha256(test_content).hexdigest()
+        
+        self.assertEqual(chunked_hash, expected_hash, "Hash from chunked method does not match expected hash.")
+        os.remove(dummy_filepath)
+
+
 if __name__ == '__main__':
     unittest.main()

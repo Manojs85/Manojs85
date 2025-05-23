@@ -38,6 +38,7 @@ A Python-based application to detect and analyze potential ransomware threats.
 ### Usage
 
 -   **Analyze a single file:**
+    Output will be color-coded for threats (Red) or clean status (Green) if not using JSON logs.
     ```bash
     python -m ransomware_analyzer.main --filepath /path/to/your/file.exe
     ```
@@ -50,3 +51,20 @@ A Python-based application to detect and analyze potential ransomware threats.
     python -m ransomware_analyzer.main --start-monitor /path/to/your/directory_to_watch
     ```
     (Press Ctrl+C to stop monitoring)
+
+### Logging Configuration
+-   By default, logs are output in a human-readable string format to console and `analyzer.log`.
+-   To enable JSON formatted logs (useful for log management systems):
+    ```bash
+    python -m ransomware_analyzer.main --filepath /path/to/file --json-logs
+    python -m ransomware_analyzer.main --start-monitor /path/to/watch --json-logs
+    ```
+
+## Dashboard Interface (Placeholder)
+
+A basic web dashboard interface is under development. To run the placeholder:
+
+1.  Navigate to the `dashboard_ui` directory: `cd dashboard_ui`
+2.  Install dashboard-specific dependencies: `pip install -r requirements_dashboard.txt`
+3.  Run the Flask app: `python app.py`
+4.  Open your browser to `http://127.0.0.1:5001` (or the configured port).

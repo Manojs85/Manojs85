@@ -1,9 +1,11 @@
 import logging
 import time
-import os # For checksum calculation in analyze_file_modification and os.walk
-import sys # For sys.argv in direct execution block
+import os 
+import sys 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+from concurrent.futures import ThreadPoolExecutor
+import threading
 from ransomware_analyzer.threat_detection.analyzer import (
     analyze_file, 
     analyze_file_modification, 
@@ -13,144 +15,162 @@ from ransomware_analyzer.threat_detection.analyzer import (
 from ransomware_analyzer.logger_config import setup_logging # Or get logger by name if already configured in main
 from ransomware_analyzer.ml_model.predictor import RansomwarePredictor
 from ransomware_analyzer.incident_response.actions import isolate_file
+# colorama is initialized in main.py, Fore/Style could be used if direct print from watcher is desired when not in JSON mode.
+# For this subtask, we will focus on structured logging via 'extra'.
 
 logger = logging.getLogger("RansomwareAnalyzer.Watcher")
-ml_predictor = RansomwarePredictor() # Initialize with no specific model path for now
 
-# Store previous checksums for modified files - simple in-memory cache
-# For a more robust solution, a persistent store or more sophisticated cache would be needed.
-file_checksums_cache = {}
+# Global objects for thread pool and synchronization
+executor = None 
+cache_lock = threading.Lock()
+file_checksums_cache = {} # In-memory cache for file checksums
+ml_predictor = RansomwarePredictor() # Initialize ML predictor globally
 
+# --- Worker function for processing file events ---
+def process_file_event(event_path, event_type):
+    logger.info(f"Processing {event_type} event for {event_path} in worker thread.",
+                extra={'filepath': event_path, 'event_type': event_type, 'thread_id': threading.get_ident()})
+    
+    # --- Re-implement logic from on_created / on_modified here ---
+    analysis_result = analyze_file(event_path) # This is I/O bound, good for threads
+
+    # ML Prediction
+    ml_analysis_result = ml_predictor.predict_ransomware_behavior(event_path) # Potentially CPU/I/O bound
+
+    # Behavioral Analysis & Checksum Management
+    current_checksum = get_file_hash(event_path) # I/O bound
+    if not current_checksum and event_type != "deleted": # File might have been deleted/moved quickly
+        logger.warning(f"Could not hash {event_path}, it may no longer exist or is inaccessible.", 
+                       extra={'filepath': event_path})
+        # No further behavioral analysis or isolation possible without current_checksum
+        return
+
+    behavior_result_for_score = None
+    original_checksum_for_comparison = None
+
+    if event_type == "created":
+        with cache_lock:
+            file_checksums_cache[event_path] = current_checksum
+        # Initial behavioral check for new files
+        behavior_result_for_score = analyze_file_modification(event_path, current_checksum=current_checksum)
+        logger.info(f"Initial behavioral analysis for new file {event_path}: {behavior_result_for_score}", 
+                    extra={'filepath': event_path, 'behavior_result': behavior_result_for_score})
+
+    elif event_type == "modified":
+        with cache_lock:
+            original_checksum_for_comparison = file_checksums_cache.get(event_path)
+        
+        if current_checksum and original_checksum_for_comparison != current_checksum:
+            behavior_result_for_score = analyze_file_modification(event_path, original_checksum_for_comparison, current_checksum)
+            logger.info(f"Behavioral analysis for modified {event_path}: {behavior_result_for_score}", 
+                        extra={'filepath': event_path, 'behavior_result': behavior_result_for_score, 'original_checksum': original_checksum_for_comparison, 'new_checksum': current_checksum})
+        elif not original_checksum_for_comparison and current_checksum:
+            behavior_result_for_score = analyze_file_modification(event_path, current_checksum=current_checksum) # No baseline
+            logger.info(f"Behavioral analysis (no baseline) for {event_path}: {behavior_result_for_score}", 
+                        extra={'filepath': event_path, 'behavior_result': behavior_result_for_score})
+        
+        if current_checksum: # Update cache if hash was successful
+            with cache_lock:
+                file_checksums_cache[event_path] = current_checksum
+        elif event_path in file_checksums_cache: # If hashing failed but was in cache
+            with cache_lock:
+                 del file_checksums_cache[event_path]
+
+
+    # Threat Scoring
+    final_score, score_reasons = calculate_threat_score(
+        analysis_result_str=analysis_result,
+        ml_result_dict=ml_analysis_result,
+        behavioral_result_str=behavior_result_for_score
+    )
+    logger.info(f"Calculated Threat Score for {event_path}: {final_score} (Reasons: {'; '.join(score_reasons)})", 
+                extra={'filepath': event_path, 'score': final_score, 'reasons': score_reasons})
+
+    # Incident Response (Isolation)
+    should_isolate = False
+    isolation_trigger_reason = ""
+    if "Known ransomware hash match" in analysis_result:
+        should_isolate = True
+        isolation_trigger_reason = "hash_match"
+    elif final_score >= 80: # Threshold for high threat
+        should_isolate = True
+        isolation_trigger_reason = f"score_threshold ({final_score})"
+
+    if should_isolate:
+        logger.critical(
+            f"High threat detected for {event_path} ({isolation_trigger_reason}). Attempting isolation.", 
+            extra={'filepath': event_path, 'trigger': isolation_trigger_reason, 'score': final_score}
+        )
+        quarantined_path = isolate_file(event_path) 
+        if quarantined_path:
+            logger.warning(
+                f"Successfully ISOLATED {event_path} to {quarantined_path}.",
+                extra={'filepath': event_path, 'quarantine_path': quarantined_path, 'status': 'success'}
+            )
+            with cache_lock: # Remove from cache as it's moved
+                if event_path in file_checksums_cache:
+                    del file_checksums_cache[event_path]
+        else:
+            logger.error(f"Failed to isolate {event_path}.", 
+                         extra={'filepath': event_path, 'status': 'failure', 'trigger': isolation_trigger_reason, 'score': final_score})
+    # --- End of re-implemented logic ---
+
+# --- Event Handler ---
 class AnalysisEventHandler(FileSystemEventHandler):
+    # Using global executor, so no need to pass it in __init__
+    
     def on_created(self, event):
         if event.is_directory:
             return
-        logger.info(f"File created: {event.src_path}")
-        analysis_result = analyze_file(event.src_path)
-        logger.info(f"Analysis for new file {event.src_path}: {analysis_result}")
-        
-        ml_analysis_result = ml_predictor.predict_ransomware_behavior(event.src_path)
-        logger.info(f"ML analysis for {event.src_path}: {ml_analysis_result}")
+        if executor:
+            logger.info(f"Queueing analysis for created file: {event.src_path}", 
+                        extra={'filepath': event.src_path, 'event_type': 'created'})
+            executor.submit(process_file_event, event.src_path, "created")
+        else:
+            logger.warning("Executor not available, cannot process created file event.", extra={'filepath': event.src_path})
 
-        # For new files, behavioral analysis (checksum changes) isn't directly applicable in the same way.
-        # However, analyze_file_modification can give info based on current_checksum and extension.
-        # We'll call it to see if it flags uncommon extensions for new files.
-        current_hash_for_new_file = get_file_hash(event.src_path)
-        behavior_result_on_create = None
-        if current_hash_for_new_file:
-            behavior_result_on_create = analyze_file_modification(event.src_path, current_checksum=current_hash_for_new_file)
-            logger.info(f"Initial behavioral check for new file {event.src_path}: {behavior_result_on_create}")
-
-        final_score, score_reasons = calculate_threat_score(
-            analysis_result_str=analysis_result,
-            ml_result_dict=ml_analysis_result,
-            behavioral_result_str=behavior_result_on_create
-        )
-        logger.info(f"Calculated Threat Score for new file {event.src_path}: {final_score} (Reasons: {'; '.join(score_reasons)})")
-
-        # Decision Logic for Isolation
-        should_isolate = False
-        if "Known ransomware hash match" in analysis_result: # Prioritize hash match
-            should_isolate = True
-            logger.critical(f"High threat detected for {event.src_path} by hash match (Score: {final_score}). Attempting isolation.")
-        elif final_score >= 80: # Example threshold, can be tuned. Hash match already covered.
-            should_isolate = True
-            logger.critical(f"High threat detected for {event.src_path} (Score: {final_score}). Attempting isolation based on score threshold.")
-        
-        # The original ML confidence check for isolation can be kept or replaced by score:
-        # if isinstance(ml_analysis_result, dict) and ml_analysis_result.get('is_suspicious') and ml_analysis_result.get('confidence', 0) >= 0.7:
-        # should_isolate = True ...
-
-        if should_isolate:
-            if isolate_file(event.src_path):
-                logger.info(f"Successfully initiated isolation for {event.src_path}.")
-                if event.src_path in file_checksums_cache:
-                    del file_checksums_cache[event.src_path]
-                return 
-            else:
-                logger.error(f"Failed to isolate {event.src_path}.")
-        
-        # Update checksum cache only if file was not isolated
-        if current_hash_for_new_file: # current_hash_for_new_file was from get_file_hash
-            file_checksums_cache[event.src_path] = current_hash_for_new_file
 
     def on_modified(self, event):
         if event.is_directory:
             return
-        logger.info(f"File modified: {event.src_path}")
-        
-        original_checksum = file_checksums_cache.get(event.src_path)
-        current_checksum = get_file_hash(event.src_path)
+        if executor:
+            logger.info(f"Queueing analysis for modified file: {event.src_path}", 
+                        extra={'filepath': event.src_path, 'event_type': 'modified'})
+            executor.submit(process_file_event, event.src_path, "modified")
+        else:
+            logger.warning("Executor not available, cannot process modified file event.", extra={'filepath': event.src_path})
 
-        # If current_checksum is None, file might be inaccessible (e.g., deleted quickly after mod)
-        if not current_checksum:
-            logger.warning(f"Could not hash {event.src_path} on modification, it may be inaccessible.")
-            if event.src_path in file_checksums_cache:
-                del file_checksums_cache[event.src_path]
-            return
 
-        # Basic analysis for any modification
-        analysis_result = analyze_file(event.src_path)
-        logger.info(f"Standard analysis for modified file {event.src_path}: {analysis_result}")
-
-        ml_analysis_result = ml_predictor.predict_ransomware_behavior(event.src_path)
-        logger.info(f"ML analysis for {event.src_path}: {ml_analysis_result}")
-
-        # Decision Logic for Isolation
-        should_isolate = False
-        if "Known ransomware hash match" in analysis_result:
-            should_isolate = True
-            logger.critical(f"High threat detected for {event.src_path} by hash match. Attempting isolation.")
-
-        if isinstance(ml_analysis_result, dict) and ml_analysis_result.get('is_suspicious') and ml_analysis_result.get('confidence', 0) >= 0.7:
-            should_isolate = True
-            logger.critical(f"High threat detected for {event.src_path} by ML model (Confidence: {ml_analysis_result.get('confidence',0)}). Attempting isolation.")
-        
-        if should_isolate:
-            if isolate_file(event.src_path):
-                logger.info(f"Successfully initiated isolation for {event.src_path}.")
-                if event.src_path in file_checksums_cache:
-                    del file_checksums_cache[event.src_path]
-                return # Stop further processing for this event as file is moved
-            else:
-                logger.error(f"Failed to isolate {event.src_path}.")
-
-        # Behavioral analysis if checksum changed and file not isolated
-        if original_checksum != current_checksum: # current_checksum is guaranteed to be non-None here
-            behavior_result = analyze_file_modification(event.src_path, original_checksum, current_checksum)
-            logger.info(f"Behavioral analysis for {event.src_path}: {behavior_result}")
-        elif not original_checksum: # File might have been created before watcher started, or cache cleared
-            behavior_result = analyze_file_modification(event.src_path, current_checksum=current_checksum)
-            logger.info(f"Behavioral analysis (no baseline) for {event.src_path}: {behavior_result}")
-
-        # Update cache with the new checksum if file not isolated
-        file_checksums_cache[event.src_path] = current_checksum
-
-    # Optional: on_deleted
     def on_deleted(self, event):
         if event.is_directory:
             return
-        logger.info(f"File deleted: {event.src_path}")
-        if event.src_path in file_checksums_cache:
-            del file_checksums_cache[event.src_path]
+        logger.info(f"File deleted: {event.src_path}", extra={'filepath': event.src_path, 'event_type': 'deleted'})
+        with cache_lock:
+            if event.src_path in file_checksums_cache:
+                del file_checksums_cache[event.src_path]
 
+# --- Monitoring Control ---
 def start_monitoring(path_to_watch):
-    # Ensure logger is configured if watcher is run standalone or before main.py configures it
-    # For this subtask, assume main.py handles initial setup_logging()
-    logger.info(f"Starting real-time monitoring on directory: {path_to_watch}")
+    global executor 
+    # Max workers: twice the number of CPUs, or 4 if CPU count can't be determined.
+    num_workers = (os.cpu_count() or 1) * 2 if os.cpu_count() else 4 
+    executor = ThreadPoolExecutor(max_workers=num_workers)
+    logger.info(f"Initialized ThreadPoolExecutor with {num_workers} workers.", extra={'num_workers': num_workers})
+
+    logger.info(f"Starting real-time monitoring on directory: {path_to_watch}", 
+                extra={'watch_path': path_to_watch})
     
-    # Pre-populate checksum cache for existing files before starting monitoring
-    logger.info(f"Pre-caching checksums for existing files in {path_to_watch}...")
+    logger.info(f"Pre-caching checksums for existing files in {path_to_watch}...",
+                extra={'watch_path': path_to_watch})
     for root, _, files in os.walk(path_to_watch):
         for name in files:
             filepath = os.path.join(root, name)
-            # Avoid analyzing files in .git or other service directories if desired
-            # if ".git" in filepath or ".svn" in filepath:
-            # continue
             file_hash = get_file_hash(filepath)
             if file_hash:
-                file_checksums_cache[filepath] = file_hash
-    logger.info(f"Pre-caching complete. Found {len(file_checksums_cache)} files.")
+                with cache_lock: # Protect cache during pre-population
+                    file_checksums_cache[filepath] = file_hash
+    logger.info(f"Pre-caching complete. Found {len(file_checksums_cache)} files.",
+                extra={'cached_files_count': len(file_checksums_cache)})
 
     event_handler = AnalysisEventHandler()
     observer = Observer()
@@ -160,26 +180,29 @@ def start_monitoring(path_to_watch):
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        observer.stop()
-        logger.info("Real-time monitor stopped by user.")
+        logger.info("Real-time monitor stopped by user (KeyboardInterrupt).")
     except Exception as e:
-        logger.error(f"Real-time monitor encountered an error: {e}")
+        logger.error(f"Real-time monitor encountered an error: {e}", exc_info=True)
+    finally:
+        if executor:
+            logger.info("Shutting down thread pool executor...")
+            executor.shutdown(wait=True)
+            executor = None # Reset global executor
+            logger.info("Thread pool executor shut down.")
+        
         observer.stop()
-    observer.join()
+        observer.join()
+        logger.info("Watchdog observer stopped and joined.")
+
 
 if __name__ == "__main__":
-    # Example of running watcher directly (for testing)
-    # In practice, main.py should configure logging first.
-    # For now, let's add a basic config here if run directly.
     if not logging.getLogger("RansomwareAnalyzer").hasHandlers():
-         setup_logging(log_level=logging.DEBUG) # Basic setup if run directly
+         setup_logging(log_level=logging.DEBUG) 
     
-    watch_path = "." # Default to current directory for direct execution
+    watch_path = "." 
     if len(sys.argv) > 1:
         watch_path = sys.argv[1]
     else:
-        logger.info("No path specified, watching current directory by default.")
+        logger.info("No path specified, watching current directory by default for standalone execution.")
     
-    # Pre-caching is now part of start_monitoring, called above.
-    # No need to call it separately here.
     start_monitoring(watch_path)

@@ -58,8 +58,14 @@ def isolate_file(filepath, quarantine_dir_base=None):
         destination_path = os.path.join(final_quarantine_path_dir, destination_filename)
 
         shutil.move(filepath, destination_path)
-        logger.warning(f"File '{filepath}' isolated to '{destination_path}'.")
-        return True
+        logger.warning(f"File '{filepath}' isolated to '{destination_path}'.", 
+                       extra={'filepath': filepath, 'destination_path': destination_path, 'status': 'success'})
+        return destination_path # Return destination path on success
+    except FileNotFoundError:
+        logger.error(f"File isolation failed: Source file '{filepath}' not found.",
+                       extra={'filepath': filepath, 'status': 'failure', 'error': 'FileNotFoundError'})
+        return None
     except Exception as e:
-        logger.error(f"Error isolating file '{filepath}': {e}")
-        return False
+        logger.error(f"Error isolating file '{filepath}': {e}", 
+                       extra={'filepath': filepath, 'status': 'failure', 'error': str(e)})
+        return None
